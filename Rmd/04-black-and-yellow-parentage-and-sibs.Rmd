@@ -1,0 +1,276 @@
+---
+title: "Doing parentage on black-and-yellow rockfish"
+output: html_notebook
+ toc: true
+---
+
+This is a first stab at parentage in black-and-yellow rockfish, based on the analysis Eric did for kelps.  In a previous document, `./Rmd/01-aggregate-genos-and-gsi-to-species.Rmd` 
+I aggregated genotypes and filtered high missers and did GSI to identify species amongst the juveniles
+and the adults. I saved those results and use them here...
+
+To start off with, let's load data and libs:
+```{r load-stuff}
+library(tidyverse)
+library(CKMRsim)
+library(stringr)
+
+
+meta <- readRDS("../data/processed/meta-data-tibble.rds")
+genos <- readRDS("../extdata/processed/genos-aggregated-and-no-hi-missers.rds")
+juvie_species <- readRDS("../data/processed/juvie-gsi-sim-assignments.rds")   # gsi assignments of juvenile fish
+adult_species <- readRDS("../data/processed/adult-gsi-sim-self-assignments.rds")   # gsi self-assignments of adult fish
+```
+
+## Selecting our fish and designating allele nomenclature
+
+We gotta pick out the _S. chrysomelas_.  For adults that is mostly done, but there are some
+obvious misassigmnments, so we use the GSI results for both adults and juvies.  
+```{r define-black-yellows}
+blackyellow_ad <- adult_species %>% 
+  filter(species == "chrysomelas",
+         score > 99) %>%
+  select(NMFS_DNA_ID) %>% unlist() %>% unname()
+
+blackyellow_juv <- juvie_species %>%
+  filter(species == "chrysomelas",
+         score > 99) %>%
+  select(NMFS_DNA_ID) %>% unlist() %>% unname
+
+```
+
+That is `r length(blackyellow_ad)` adults and `r length(blackyellow_juv)` juveniles.  
+With those we filter down the genos to the ones that we want, and then we
+can get it into the format required for CKMR.
+```{r blackyellow-genos}
+blackyellow_genos <- genos %>%
+  filter(NMFS_DNA_ID %in% c(blackyellow_ad, blackyellow_juv))
+
+# we will use this some more
+byg2 <- blackyellow_genos %>% 
+  select(NMFS_DNA_ID, locus, allele) %>%
+  mutate(Chrom = "GTseq") %>% 
+  mutate(Pos = as.integer(factor(locus, levels = unique(locus)))) %>%
+  rename(Locus = locus,
+         Allele = allele) %>%
+  select(NMFS_DNA_ID, Chrom, Locus, Pos, Allele) %>%
+  ungroup()
+
+# get the allele freqs
+byg_ckmr_markers <- byg2 %>%
+  filter(!is.na(Allele)) %>% # it is vital to filter out the NAs at this stage
+  group_by(Chrom, Locus, Pos, Allele) %>%
+  summarise(counts = n()) %>%
+  group_by(Locus, Pos) %>%
+  mutate(Freq = counts / sum(counts)) %>%
+  select(-counts) %>%
+  mutate(AlleIdx = 1,
+         LocIdx = 1) %>%
+  reindex_markers(.)
+```
+We have a total `r nrow(byg_ckmr_markers)` alleles for black-and-yellow rockfish in this data set.
+
+## Doing CKMR simulations to assess power
+
+Really simply let's just do this to see what our power for parentage ought to look like.
+```{r CKMR-create}
+CK_by <- create_ckmr(byg_ckmr_markers, kappa_matrix = kappas[c("PO", "FS", "HS", "U"), ])
+
+# see what it tells us when we print it:
+CK_by
+```
+
+Then do the simulations to see what the false positive rates are for finding parents when the truth
+is U or FS:
+```{r CKMR-sim-and-sample}
+Qs <- simulate_Qij(C = CK_by, froms = c("PO", "FS", "HS", "U"), tos = c("PO", "FS", "HS", "U"), reps = 10^4)
+
+# then do the importance sampling to get the FPRs
+mc_sample_simple(Qs, nu = "PO", de = c("U", "FS"), tr = c("U", "FS"), method = "both")
+```
+
+We can come back to that later to see about finding Full Sibs.
+
+## Making genotype matrices
+```{r}
+blackyellow_haps <- blackyellow_genos %>%
+  filter(!is.na(allele)) %>%  # once again, it is critical to remove these at this point
+  select(NMFS_DNA_ID, locus, gene_copy, allele) %>%
+  rename(Locus = locus, Allele = allele)
+
+blackyellow_idx_frame <- byg_ckmr_markers %>%
+  select(Locus, Allele, LocIdx, AlleIdx) %>%
+  group_by(Locus) %>%
+  mutate(NumA = n()) %>%  # get the number of alleles at each locus
+  ungroup() %>%
+  left_join(blackyellow_haps, .)  %>%  # join the alle_idx's onto the actual genotype data
+  select(NMFS_DNA_ID, Locus, gene_copy, LocIdx, NumA, AlleIdx) %>%
+  spread(key = gene_copy, value = AlleIdx) %>%
+  mutate(GenoIdx = index_ab(a = `1`, b = `2`, A = NumA))
+
+# make a matrix of genotype integers 
+wide_blackyellow <- blackyellow_idx_frame %>%
+  select(NMFS_DNA_ID, LocIdx, GenoIdx) %>%
+  spread(data = ., key = LocIdx, value = GenoIdx)
+```
+
+Don't forget to set NA's to 0, and then decrease each value by 1:
+```{r make-mat}
+rocky_mat <- as.matrix(wide_blackyellow[, -1])
+rownames(rocky_mat) <- wide_blackyellow$NMFS_DNA_ID
+rocky_mat[is.na(rocky_mat)] <- 0
+rocky_mat <- rocky_mat - 1
+storage.mode(rocky_mat) <-  "integer"
+```
+
+## Looking for duplicated samples
+
+We can quickly look through rocky_mat for pairs of indivs with lots of matching genotypes.
+```{r check-for-dupes}
+matchers <- pairwise_geno_id(S = rocky_mat, max_miss = 12) %>%
+  arrange(num_mismatch) %>%
+  mutate(NMFS_DNA_ID_1 = rownames(rocky_mat)[ind1],
+         NMFS_DNA_ID_2 = rownames(rocky_mat)[ind2])
+matchers
+```
+We need to deal with these somehow.  But before we do that, I want to use these numbers to come up with
+a per-genotype discordance rate.  That should be pretty straightforward:
+```{r compute-discordance-rate}
+sum(matchers$num_mismatch) / sum(matchers$num_loc)
+
+```
+So, to repeat, the discordance rate across all these multiply-genotyped individuals is
+`r sum(matchers$num_mismatch) / sum(matchers$num_loc)`---roughly 8 in 1000. Higher than for kelp, but hopefully reasonable. 
+
+### Investigate the read depths of these duplicate mismatches
+
+```{r depths-of-dupies}
+# just gonna write this to a file and do it elsewhere
+saveRDS(matchers, file = "rds_outputs/blackyellow_matchers.rds")
+```
+
+Now, to deal with these duplicates, here is what I will do: I am going to say that anyone with 3 or fewer mismatches is certainly 
+the same individual, and we are going to take just one from amongst those pairs/groups.  We use a hasty method:
+we toss out all the individuals that appear in both ind1 and ind2, and then all the remaining ind2's.  This 
+might throw out one more than we need to, but it is what we do for now.
+```{r toss-matchers}
+def_same <- matchers %>%
+  filter(num_mismatch <= 3)
+
+toss_these <- c(intersect(def_same$ind1, def_same$ind2), def_same$ind2) %>%
+  unique()
+
+rocky_mat_tossed <- rocky_mat[-toss_these,]
+```
+
+Now we have to break that into two matrices: one for the adults and one for the kids.
+This should not be too hard.  We have to deal with the fact that not all of the adults in the meta data
+had few enough missing genotypes to be included.
+```{r break-stage}
+blackyellow_ad_kept <- blackyellow_ad[blackyellow_ad %in% rownames(rocky_mat_tossed)]
+blackyellow_juv_kept <- blackyellow_juv[blackyellow_juv %in% rownames(rocky_mat_tossed)]
+
+adult_mat <- rocky_mat_tossed[blackyellow_ad_kept, ]
+juvie_mat <- rocky_mat_tossed[blackyellow_juv_kept, ]
+```
+
+
+## Save all those black-and-yellow genotypes for quick analysis of other things
+```{r dump-genos}
+blackyellow_haps %>%
+  filter(NMFS_DNA_ID %in% rownames(rocky_mat_tossed)) %>%
+  saveRDS("rds_outputs/blackyellow_genos_used_long.rds", compress = "xz")
+```
+
+## Before doing the comparisons, compute internal heterozygosities
+
+We want to have these to make sure we don't have contaminated individauls.
+```{r compute-int-hzs}
+int_hz <- byg2 %>% 
+  group_by(NMFS_DNA_ID, Locus) %>% 
+  summarise(hz = Allele[1]!=Allele[2]) %>% 
+  filter(!is.na(hz)) %>% 
+  group_by(NMFS_DNA_ID) %>% 
+  summarise(num_loc = n(), num_hz = sum(hz), fract_hz = num_hz / num_loc)
+```
+And now let us plot that .
+```{r plot-int-hz, fig.width=12}
+ggplot(int_hz, aes(x = fract_hz)) +
+  geom_density(fill = "orange", alpha = 0.3)
+```
+
+So, we would be suspicious of individuals with int_hz > .6 or less than 0.28.
+
+## Doing the comparisons
+
+We need to flatten the CKMR object appropriately
+```{r flatten}
+# flatten those out
+po_flat <- flatten_ckmr(CK_by, "PO")
+unrel_flat <- flatten_ckmr(CK_by, "U")
+
+# then compute the log-likelihoods for the parent offspring relationship
+po_logl_flat <- po_flat
+po_logl_flat$probs <- log(po_flat$probs / unrel_flat$probs)
+
+```
+
+Now we are ready to do these!
+```{r do-comps}
+idx <- 1:nrow(juvie_mat)
+names(idx) <- idx
+comps <- lapply(idx, function(i) {
+    tmp <- comp_ind_pairwise(S = adult_mat, T = juvie_mat, t = i, values = po_logl_flat$probs, nGenos = po_logl_flat$nGenos, Starts = po_logl_flat$base0_locus_starts)
+    #tmp[rev(top_index(tmp$value, 5)), ]  # just take the top 5 from each
+    }) %>%
+  dplyr::bind_rows(.id = "offspring") %>%
+  dplyr::tbl_df() 
+
+# make int_hz something we can join on there
+tmp1 <- int_hz %>% rename(id1 = NMFS_DNA_ID, fract_hz1 = fract_hz) %>% select(id1, fract_hz1)
+tmp2 <- int_hz %>% rename(id2 = NMFS_DNA_ID, fract_hz2 = fract_hz) %>% select(id2, fract_hz2)
+
+# have a look at that
+result <- arrange(comps, desc(value)) %>%
+  mutate(number = 1:nrow(.)) %>%
+  mutate(id1 = rownames(juvie_mat)[as.integer(offspring)],
+         id2 = rownames(adult_mat)[ind]) %>%
+  left_join(tmp1) %>%
+  left_join(tmp2)
+
+result %>% filter(number <= 1000)
+
+```
+None of these values suggest any confident parent-offspring pairs. That's not terribly surprising given the overall small number of comparisons for black-and-yellow adults/juvs.
+
+Try plotting all those pairs, and compare them to the simulated values
+```{r plot-all-pairs-density, fig.width = 6}
+simlogls <- extract_logls(Q = Qs, numer = c(PO = 1), denom = c(U = 1))
+ggplot(result, aes(x = value)) +
+  geom_density(colour = "red") +
+  geom_density(data = simlogls, aes(x = logl_ratio, fill = true_relat), alpha = 0.25) +
+  scale_x_continuous(breaks = seq(-170, 60, by = 20)) +
+  xlab("Parent-offspring versus Unrelated Log-Likelihood Ratio")
+
+
+# save it too
+ggsave(filename = "blackyellow_po_logls.pdf", width = 8, height = 4)
+
+```
+
+Put the to 1000 guys on the plot:
+```{r distro-plot}
+top1000 <- result %>% filter(number <= 1000) %>%
+  mutate(yline = -0.001)
+
+ggplot(result, aes(x = value)) +
+  geom_density(colour = "red") +
+  geom_density(data = simlogls, aes(x = logl_ratio, fill = true_relat), alpha = 0.25) +
+  scale_x_continuous(breaks = seq(-170, 60, by = 20)) +
+  xlab("Parent-offspring versus Unrelated Log-Likelihood Ratio") +
+  geom_jitter(data = top1000, aes(x = value, y = yline), colour = "black", width = 0.0, height = .0003)
+
+
+ggsave(filename = "black_yellow_po_logls_points.pdf", width = 8, height = 4)
+```
+
+The red line for the observed distribution falls above the unrelated distribution, which looks clean.
